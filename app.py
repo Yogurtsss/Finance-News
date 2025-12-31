@@ -34,6 +34,18 @@ from groq import Groq
 from flask import Flask, jsonify, request
 from logging.handlers import RotatingFileHandler
 
+try:
+    import psutil
+    HAS_PSUTIL = True
+except ImportError:
+    HAS_PSUTIL = False
+
+try:
+    from pythonjsonlogger import jsonlogger
+    HAS_JSON_LOGGER = True
+except ImportError:
+    HAS_JSON_LOGGER = False
+
 # --- Initial Setup ---
 load_dotenv()
 
@@ -122,8 +134,18 @@ class DatabaseManager:
         self._initialize_db()
 
     def _initialize_db(self) -> None:
-        """Create database tables if they don't exist"""
+        """Create database tables if they don't exist with schema versioning"""
         with self.get_connection() as conn:
+            # Schema version table for migrations
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS schema_version (
+                    version INTEGER PRIMARY KEY,
+                    applied_at TEXT NOT NULL
+                )
+                """
+            )
+
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS sent_articles (
@@ -291,14 +313,14 @@ class DatabaseManager:
                 logging.error(f"Database error adding processed article: {e}")
 
     def get_processed_articles(self, limit: Optional[int] = None, offset: int = 0) -> List[Dict[str, Any]]:
-        """Retrieve processed articles from database"""
+        """Retrieve processed articles from database with safe pagination"""
         with self.get_connection() as conn:
-            query = "SELECT * FROM processed_articles ORDER BY timestamp DESC"
-            params: Tuple[Any, ...] = ()
-            if limit is not None:
-                query += " LIMIT ? OFFSET ?"
-                params = (int(limit), int(offset))
-            cursor = conn.execute(query, params)
+            # Enforce reasonable limits to prevent memory issues
+            safe_limit = min(int(limit or 100), 1000)
+            safe_offset = max(0, int(offset))
+            
+            query = "SELECT * FROM processed_articles ORDER BY timestamp DESC LIMIT ? OFFSET ?"
+            cursor = conn.execute(query, (safe_limit, safe_offset))
             return [dict(row) for row in cursor.fetchall()]
 
     def search_articles(self, search_term: str, limit: int = MAX_SEARCH_RESULTS) -> List[Dict[str, Any]]:
@@ -416,6 +438,11 @@ class BotConfig:
     image_validation_timeout: int = 7
     sort_refresh_interval: int = 300
 
+    # Webhook config
+    use_webhook: bool = False
+    webhook_url: Optional[str] = None
+    webhook_port: int = 5001
+
     # LLM configs
     groq_primary_model: str = "llama-3.3-70b-versatile"
     groq_fallback_model: str = "llama-3.1-8b-instant"
@@ -467,6 +494,9 @@ class BotConfig:
             llm_top_p=get_env_float("LLM_TOP_P", 1.0),
             llm_max_tokens=get_env_int("LLM_MAX_TOKENS", 8192),
             groq_service_tier=os.getenv("GROQ_SERVICE_TIER", "auto"),
+            use_webhook=os.getenv("USE_WEBHOOK", "false").lower() == "true",
+            webhook_url=os.getenv("WEBHOOK_URL"),
+            webhook_port=get_env_int("WEBHOOK_PORT", 5001),
         )
 
     def validate(self) -> None:
@@ -766,7 +796,13 @@ class BitcoinNewsBot:
             backupCount=5,
             encoding="utf-8",
         )
-        file_handler.setFormatter(formatter)
+        
+        # Use JSON formatter if available, otherwise use standard formatter
+        if HAS_JSON_LOGGER:
+            json_formatter = jsonlogger.JsonFormatter()
+            file_handler.setFormatter(json_formatter)
+        else:
+            file_handler.setFormatter(formatter)
 
         root_logger = logging.getLogger()
         root_logger.setLevel(logging.INFO)
@@ -854,18 +890,33 @@ class BitcoinNewsBot:
                 url = f"https://newsdata.io/api/1/news?apikey={self.config.newsdata_api_key}&q={keyword}&language=en"
                 r = self.session.get(url, timeout=self.config.external_api_timeout)
                 r.raise_for_status()
-                for item in r.json().get("results", []):
-                    if item.get("title") and item.get("link"):
-                        all_articles.append({
-                            "title": item["title"],
-                            "link": item["link"],
-                            "description": item.get("description") or item.get("content"),
-                            "image_url": item.get("image_url"),
-                            "pubDate": item.get("pubDate"),
-                            "source": "NewsData.io",
-                        })
-            except Exception as e:
+                
+                data = r.json()
+                if not isinstance(data, dict) or "results" not in data:
+                    self.logger.warning("Invalid response structure from NewsData.io")
+                else:
+                    for item in data.get("results", []):
+                        if not isinstance(item, dict):
+                            continue
+                        title = item.get("title")
+                        link = item.get("link")
+                        if title and link and isinstance(title, str) and isinstance(link, str):
+                            all_articles.append({
+                                "title": title.strip(),
+                                "link": link.strip(),
+                                "description": (item.get("description") or item.get("content") or "").strip(),
+                                "image_url": item.get("image_url"),
+                                "pubDate": item.get("pubDate"),
+                                "source": "NewsData.io",
+                            })
+            except requests.exceptions.Timeout:
+                self.logger.error("NewsData.io request timed out")
+                self.metrics.increment("api_errors")
+            except requests.exceptions.RequestException as e:
                 self.logger.error(f"Failed to fetch from NewsData.io: {e}")
+                self.metrics.increment("api_errors")
+            except Exception as e:
+                self.logger.error(f"Unexpected error fetching from NewsData.io: {e}")
                 self.metrics.increment("api_errors")
 
         if self.config.marketaux_api_key:
@@ -879,18 +930,33 @@ class BitcoinNewsBot:
                 url = f"https://api.marketaux.com/v1/news/all?api_token={self.config.marketaux_api_key}&{param}&language=en"
                 r = self.session.get(url, timeout=self.config.external_api_timeout)
                 r.raise_for_status()
-                for item in r.json().get("data", []):
-                    if item.get("title") and item.get("url"):
-                        all_articles.append({
-                            "title": item["title"],
-                            "link": item["url"],
-                            "description": item.get("description") or item.get("snippet"),
-                            "image_url": item.get("image_url"),
-                            "pubDate": item.get("published_at"),
-                            "source": "MarketAux",
-                        })
-            except Exception as e:
+                
+                data = r.json()
+                if not isinstance(data, dict) or "data" not in data:
+                    self.logger.warning("Invalid response structure from MarketAux")
+                else:
+                    for item in data.get("data", []):
+                        if not isinstance(item, dict):
+                            continue
+                        title = item.get("title")
+                        link = item.get("url")
+                        if title and link and isinstance(title, str) and isinstance(link, str):
+                            all_articles.append({
+                                "title": title.strip(),
+                                "link": link.strip(),
+                                "description": (item.get("description") or item.get("snippet") or "").strip(),
+                                "image_url": item.get("image_url"),
+                                "pubDate": item.get("published_at"),
+                                "source": "MarketAux",
+                            })
+            except requests.exceptions.Timeout:
+                self.logger.error("MarketAux request timed out")
+                self.metrics.increment("api_errors")
+            except requests.exceptions.RequestException as e:
                 self.logger.error(f"Failed to fetch from MarketAux: {e}")
+                self.metrics.increment("api_errors")
+            except Exception as e:
+                self.logger.error(f"Unexpected error fetching from MarketAux: {e}")
                 self.metrics.increment("api_errors")
 
         # Deduplicate by link
@@ -926,7 +992,7 @@ class BitcoinNewsBot:
             return self._queue_seq
 
     def api_request_worker(self) -> None:
-        """Worker thread with priority handling"""
+        """Worker thread with priority handling and queue monitoring"""
         self.logger.info("Groq API worker thread started.")
         while not self.shutdown_event.is_set():
             try:
@@ -942,7 +1008,10 @@ class BitcoinNewsBot:
                     self.logger.debug(f"Worker processing {request_id} (priority: {priority})")
                     response = self._call_groq_api_with_retry(*request_data, request_id=request_id)
                     if callback:
-                        callback(response)
+                        try:
+                            callback(response)
+                        except Exception as e:
+                            self.logger.error(f"Callback error for {request_id}: {e}")
                 except Exception as e:
                     self.logger.error(f"Error processing request {request_id}: {e}")
                     self.metrics.increment("api_errors")
@@ -950,6 +1019,10 @@ class BitcoinNewsBot:
                     self.api_request_queue.task_done()
 
             except queue.Empty:
+                # Monitor queue size periodically
+                queue_size = self.api_request_queue.qsize()
+                if queue_size > 100:
+                    self.logger.warning(f"Groq queue size is high: {queue_size}")
                 continue
             except Exception as e:
                 self.logger.critical(f"API worker critical error: {e}", exc_info=True)
@@ -1151,12 +1224,29 @@ Example:
                     if pruned > 0:
                         self.logger.info(f"Pruned {pruned} old processed articles")
 
+                # Cleanup old feedback every 50 cycles (less frequent)
+                if cycle_count % 50 == 0:
+                    self._cleanup_old_feedback(days_to_keep=90)
+
             except Exception as e:
                 self.logger.critical(f"Unhandled exception in news monitor loop: {e}", exc_info=True)
 
             self.shutdown_event.wait(self.config.news_check_interval)
 
         self.logger.info("News monitor thread shutting down.")
+
+    def _cleanup_old_feedback(self, days_to_keep: int = 90) -> None:
+        """Clean up old feedback records from database"""
+        cutoff_date = (datetime.now(timezone.utc) - timedelta(days=days_to_keep)).isoformat()
+        with self.db.get_connection() as conn:
+            try:
+                cursor = conn.execute("DELETE FROM feedback WHERE timestamp < ?", (cutoff_date,))
+                deleted = cursor.rowcount or 0
+                conn.commit()
+                if deleted > 0:
+                    self.logger.info(f"Cleaned up {deleted} old feedback records")
+            except sqlite3.Error as e:
+                self.logger.error(f"Database error cleaning feedback: {e}")
 
     def run_news_cycle(self, keyword: str = "Bitcoin") -> None:
         self.logger.info(f"--- Starting news cycle for: {keyword} ---")
@@ -1315,7 +1405,7 @@ Example:
             return False
 
     def _send_telegram_message_safe(self, chat_id, text=None, photo=None, max_attempts: int = 3, **kwargs):
-        """Safe Telegram message sending with bounded retry logic"""
+        """Safe Telegram message sending with bounded retry logic and persistence"""
         for attempt in range(max_attempts):
             try:
                 if photo:
@@ -1333,12 +1423,16 @@ Example:
                 if e.error_code in [401, 403]:
                     self.logger.critical(f"Telegram auth error: {getattr(e, 'description', str(e))}")
                     return None
-                self.logger.error(f"Telegram API error: {e}")
-                time.sleep(2 * (attempt + 1))
+                self.logger.error(f"Telegram API error (attempt {attempt + 1}/{max_attempts}): {e}")
+                if attempt + 1 < max_attempts:
+                    time.sleep(2 * (attempt + 1))
             except Exception as e:
-                self.logger.error(f"Unexpected Telegram error: {e}", exc_info=True)
+                self.logger.error(f"Unexpected Telegram error (attempt {attempt + 1}/{max_attempts}): {e}", exc_info=True)
                 self.metrics.increment("api_errors")
-                time.sleep(2 * (attempt + 1))
+                if attempt + 1 < max_attempts:
+                    time.sleep(2 * (attempt + 1))
+        
+        self.logger.error(f"Failed to send Telegram message after {max_attempts} attempts")
         return None
 
     def _post_telegram_message(self, title: str, summary: str, link: str, hashtags: Optional[str], image_url: Optional[str]) -> bool:
@@ -1410,8 +1504,11 @@ Example:
                     api_v1 = tweepy.API(auth_v1)
                     media = api_v1.media_upload(filename="image.jpg", file=io.BytesIO(response.content))
                     media_id = media.media_id_string
+                    self.logger.debug(f"Twitter media uploaded: {media_id}")
+                except requests.exceptions.Timeout:
+                    self.logger.warning("Twitter media upload timed out, posting without image")
                 except Exception as e:
-                    self.logger.error(f"Twitter media upload failed: {e}")
+                    self.logger.warning(f"Twitter media upload failed, posting without image: {e}")
 
             resp = client.create_tweet(text=message, media_ids=[media_id] if media_id else None)
             self.logger.info(f"Posted Tweet: https://twitter.com/user/status/{resp.data['id']}")
@@ -1420,6 +1517,7 @@ Example:
 
         except tweepy.errors.TooManyRequests:
             self.logger.warning("Twitter rate limit hit. Skipping tweet.")
+            self.metrics.increment("api_errors")
             return False
         except Exception as e:
             self.logger.error(f"Error posting tweet: {e}")
@@ -1439,6 +1537,7 @@ Example:
         self.bot.message_handler(commands=["history"])(self.history_command)
         self.bot.message_handler(commands=["poll"])(self.poll_command)
         self.bot.message_handler(commands=["stats"])(self.stats_command)
+        self.bot.message_handler(commands=["admin"])(self.admin_command)
         self.bot.callback_query_handler(func=lambda call: call.data.startswith("feedback:"))(self.feedback_callback)
         self.bot.message_handler(func=lambda msg: True, content_types=["text"])(self.default_message_handler)
 
@@ -1453,6 +1552,7 @@ Example:
             "history": "מחיר היסטורי של ביטקוין",
             "poll": "צור סקר שוק (קבוצות)",
             "stats": "סטטיסטיקות הבוט",
+            "admin": "פקודות ניהול (מנהלים בלבד)",
             "help": "הצג עזרה",
         }
         try:
@@ -1654,6 +1754,64 @@ Example:
 📈 <b>קצב עיבוד:</b> {metrics['processing_rate_per_hour']} ידיעות/שעה
 """
         self.bot.reply_to(message, stats_msg, parse_mode="HTML")
+
+    def admin_command(self, message) -> None:
+        """Admin commands for remote bot management"""
+        admin_token = os.getenv(ADMIN_TOKEN_ENV, "")
+        if not admin_token:
+            self.bot.reply_to(message, "פקודות ניהול אינן מופעלות.")
+            return
+
+        parts = message.text.split(maxsplit=2)
+        if len(parts) < 2:
+            self.bot.reply_to(
+                message,
+                "שימוש: `/admin <פקודה> [טוקן]`\n\nפקודות:\n"
+                "• `cache_clear` - נקה מטמון\n"
+                "• `db_cleanup` - נקה מסד נתונים\n"
+                "• `queue_status` - סטטוס תור\n"
+                "• `restart` - הפעל מחדש",
+                parse_mode="Markdown"
+            )
+            return
+
+        cmd = parts[1].lower()
+        token = parts[2] if len(parts) > 2 else ""
+
+        if token != admin_token:
+            self.logger.warning(f"Unauthorized admin attempt from {message.from_user.id}: {cmd}")
+            self.bot.reply_to(message, "❌ טוקן לא תקין.")
+            return
+
+        try:
+            if cmd == "cache_clear":
+                self.context_cache.clear()
+                self.bot.reply_to(message, "✅ מטמון נוקה בהצלחה.")
+                self.logger.info(f"Admin {message.from_user.id} cleared cache")
+
+            elif cmd == "db_cleanup":
+                deleted_sent = self.db.cleanup_old_sent_articles(days_to_keep=30)
+                deleted_proc = self.db.cleanup_old_processed_articles(max_rows=MAX_PROCESSED_ARTICLES)
+                msg = f"✅ ניקוי מסד נתונים הושלם:\n• Hashes: {deleted_sent}\n• Articles: {deleted_proc}"
+                self.bot.reply_to(message, msg)
+                self.logger.info(f"Admin {message.from_user.id} cleaned database")
+
+            elif cmd == "queue_status":
+                queue_size = self.api_request_queue.qsize()
+                msg = f"📊 סטטוס תור Groq:\n• גודל: {queue_size}\n• מקסימום: ∞"
+                self.bot.reply_to(message, msg)
+
+            elif cmd == "restart":
+                self.bot.reply_to(message, "🔄 הבוט מתחיל מחדש...")
+                self.logger.info(f"Admin {message.from_user.id} initiated restart")
+                self.shutdown_event.set()
+
+            else:
+                self.bot.reply_to(message, f"❌ פקודה לא ידועה: {cmd}")
+
+        except Exception as e:
+            self.logger.error(f"Admin command error: {e}")
+            self.bot.reply_to(message, f"❌ שגיאה בביצוע הפקודה: {str(e)[:100]}")
 
     def feedback_callback(self, call) -> None:
         self.logger.info(f"Feedback from user {call.from_user.id}: {call.data}")
@@ -1888,6 +2046,22 @@ Example:
         )
         news_thread.start()
 
+        if self.config.use_webhook and self.config.webhook_url:
+            self.logger.info(f"Starting Telegram webhook mode at {self.config.webhook_url}")
+            try:
+                self.bot.remove_webhook()
+                time.sleep(1)
+                self.bot.set_webhook(url=self.config.webhook_url)
+                self.logger.info("Webhook registered successfully")
+            except Exception as e:
+                self.logger.error(f"Failed to set webhook: {e}. Falling back to polling.")
+                self._start_polling()
+        else:
+            self.logger.info("Starting Telegram polling mode...")
+            self._start_polling()
+
+    def _start_polling(self) -> None:
+        """Start polling mode for Telegram updates"""
         self.logger.info("Starting Telegram polling...")
         try:
             self.bot.infinity_polling(
@@ -1944,18 +2118,18 @@ def health_check():
         status = "degraded"
         details["groq_warning"] = "Queue size is high"
 
-    # Memory usage
-    try:
-        import psutil
-        process = psutil.Process()
-        memory_mb = process.memory_info().rss / 1024 / 1024
-        details["memory_mb"] = round(memory_mb, 2)
-        if memory_mb > 500:
-            details["memory_warning"] = "High memory usage"
-    except ImportError:
+    # Memory usage (if psutil available)
+    if HAS_PSUTIL:
+        try:
+            process = psutil.Process()
+            memory_mb = process.memory_info().rss / 1024 / 1024
+            details["memory_mb"] = round(memory_mb, 2)
+            if memory_mb > 500:
+                details["memory_warning"] = "High memory usage"
+        except Exception as e:
+            details["memory_error"] = str(e)
+    else:
         details["memory_mb"] = "psutil not installed"
-    except Exception as e:
-        details["memory_error"] = str(e)
 
     # Thread health
     details["threads"] = {
@@ -1992,6 +2166,26 @@ def clear_cache():
         bot_instance.context_cache.clear()
         return jsonify({"status": "success", "message": "Cache cleared"})
     return jsonify({"error": "Bot not initialized"}), 503
+
+
+@app.route("/webhook/telegram", methods=["POST"])
+def telegram_webhook():
+    """Telegram webhook endpoint for receiving updates"""
+    if not bot_instance:
+        return jsonify({"status": "error"}), 503
+
+    try:
+        json_data = request.get_json()
+        if not json_data:
+            return jsonify({"status": "error", "message": "No JSON data"}), 400
+
+        update = telebot.types.Update.de_json(json_data)
+        bot_instance.bot.process_new_updates([update])
+        return jsonify({"status": "ok"})
+
+    except Exception as e:
+        app.logger.error(f"Webhook error: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
 
 
 def main():
