@@ -444,8 +444,8 @@ class BotConfig:
     webhook_port: int = 5001
 
     # LLM configs
-    groq_primary_model: str = "llama-3.3-70b-versatile"
-    groq_fallback_model: str = "llama-3.1-8b-instant"
+    groq_primary_model: str = "openai/gpt-oss-120b"
+    groq_fallback_model: str = "llama-3.3-70b-versatile"
     llm_temperature: float = 0.2
     llm_top_p: float = 1.0
     llm_max_tokens: int = 8192
@@ -488,8 +488,8 @@ class BotConfig:
             external_api_timeout=get_env_int("EXTERNAL_API_TIMEOUT", 15),
             image_validation_timeout=get_env_int("IMAGE_VALIDATION_TIMEOUT", 7),
             sort_refresh_interval=get_env_int("SORT_REFRESH_INTERVAL_SECONDS", 300),
-            groq_primary_model=os.getenv("GROQ_PRIMARY_MODEL", "llama-3.3-70b-versatile"),
-            groq_fallback_model=os.getenv("GROQ_FALLBACK_MODEL", "llama-3.1-8b-instant"),
+            groq_primary_model=os.getenv("GROQ_PRIMARY_MODEL", "openai/gpt-oss-120b"),
+            groq_fallback_model=os.getenv("GROQ_FALLBACK_MODEL", "llama-3.3-70b-versatile"),
             llm_temperature=get_env_float("LLM_TEMPERATURE", 0.2),
             llm_top_p=get_env_float("LLM_TOP_P", 1.0),
             llm_max_tokens=get_env_int("LLM_MAX_TOKENS", 8192),
